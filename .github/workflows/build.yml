@@ -46,44 +46,60 @@ jobs:
           echo "=== Downloading ZIP ==="
           echo "URL: ${{ github.event.inputs.zip_url }}"
 
-          curl -L \
+          # Install tools jika belum ada
+          sudo apt-get update -qq && sudo apt-get install -y -qq file xxd unzip > /dev/null || true
+
+          HTTP_CODE=$(curl -L --fail --retry 3 --retry-delay 2 \
             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
             -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "User-Agent: FlutterBuildBot/3.0.0" \
             "${{ github.event.inputs.zip_url }}" \
             -o project.zip \
-            -w "\n=== HTTP Status: %{http_code} ===\n=== Final URL: %{url_effective} ===\n"
+            -w "%{http_code}" || echo "000")
 
+          echo "HTTP Status: $HTTP_CODE"
           echo ""
           echo "=== File Info ==="
-          ls -lh project.zip
+          ls -lh project.zip || true
 
           echo ""
           echo "=== File Type ==="
-          file project.zip
+          file project.zip || true
 
           echo ""
-          echo "=== First Bytes ==="
-          xxd project.zip | head -2
+          echo "=== First 200 bytes (hex) ==="
+          xxd project.zip | head -5 || true
+
+          echo ""
+          echo "=== First 300 chars (text) ==="
+          head -c 300 project.zip || true
+          echo ""
+
+          # Validasi awal: harus ZIP (magic number PK)
+          if ! unzip -t project.zip > /tmp/unzip_test.log 2>&1; then
+            echo "❌ File yang di-download BUKAN ZIP valid!"
+            echo "Kemungkinan penyebab:"
+            echo "  1. secrets.GH_TOKEN kosong / salah / expired di repo Settings → Secrets"
+            echo "  2. Token tidak punya scope 'repo' (untuk private asset / draft release)"
+            echo "  3. URL zip_url salah atau asset sudah dihapus"
+            echo ""
+            echo "=== Isi file (max 2KB) ==="
+            head -c 2048 project.zip || true
+            echo ""
+            cat /tmp/unzip_test.log || true
+            exit 1
+          fi
+
+          echo "✅ Download ZIP berhasil & valid"
 
       # =========================
       # EXTRACT ZIP
       # =========================
       - name: Extract ZIP
         run: |
-          echo "=== Validating ZIP ==="
-
-          if ! unzip -t project.zip > /dev/null 2>&1; then
-            echo "❌ File bukan ZIP valid!"
-            echo ""
-            echo "=== Isi file ==="
-            cat project.zip
-            exit 1
-          fi
-
-          echo "✅ ZIP valid"
-
-          echo ""
           echo "=== Extracting ZIP ==="
+          # Sudah divalidasi di step Download
           unzip -q project.zip -d project_raw
 
           echo ""

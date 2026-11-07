@@ -135,29 +135,31 @@ jobs:
           mkdir -p "$GRADLE_USER_HOME"
           cat > "$GRADLE_USER_HOME/gradle.properties" << GPEOF
           org.gradle.java.home=$JAVA_HOME
-          org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8 -XX:+UseContainerSupport
+          org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8 -XX:+UseContainerSupport --enable-native-access=ALL-UNNAMED
           org.gradle.parallel=true
           org.gradle.caching=true
           org.gradle.daemon=true
-          org.gradle.configuration-cache=true
-          org.gradle.configuration-cache.problems=warn
-          org.gradle.configureondemand=true
+          org.gradle.configuration-cache=false
+          org.gradle.configureondemand=false
           org.gradle.workers.max=4
           org.gradle.vfs.watch=false
           kotlin.incremental=true
           kotlin.compiler.execution.strategy=in-process
-          kotlin.incremental.useClasspathSnapshot=true
           android.enableR8.fullMode=false
           android.enableBuildCache=true
           android.useAndroidX=true
-          android.enableJetifier=false
+          android.enableJetifier=true
           android.defaults.buildfeatures.buildconfig=false
           android.defaults.buildfeatures.aidl=false
           android.defaults.buildfeatures.renderscript=false
           android.defaults.buildfeatures.shaders=false
           android.nonTransitiveRClass=true
           android.nonFinalResIds=true
+          android.suppressUnsupportedCompileSdk=35,36
           GPEOF
+          # Bunuh daemon Gradle lama (bisa masih pegang Java 25 dari runner)
+          (cd /tmp && pkill -f 'GradleDaemon' 2>/dev/null) || true
+          rm -rf "$GRADLE_USER_HOME/daemon" 2>/dev/null || true
 
           # Download + extract project
           HTTP_CODE=$(curl -fsSL --retry 2 --retry-delay 0 --connect-timeout 8 --max-time 60 --compressed \
@@ -181,14 +183,42 @@ jobs:
           cd "$PROJECT_DIR"
           echo "[$(now)s] Project ready"
 
+          # ── Patch project Android: buang buildToolsVersion usang (mis. 25.0.5),
+          #    naikkan compileSdk, pastikan minSdk aman. Ini penyebab umum error
+          #    "* What went wrong:\n25.0.5" di assembleRelease.
+          if [ -d android ]; then
+            # Hapus / netralkan baris buildToolsVersion (AGP modern memilih sendiri)
+            find android -type f \( -name "*.gradle" -o -name "*.gradle.kts" \) -print0 2>/dev/null | while IFS= read -r -d "" f; do
+              sed -i -E '/buildToolsVersion/d' "$f" 2>/dev/null || true
+              # compileSdkVersion 2x/3x -> 35
+              sed -i -E 's/compileSdkVersion[[:space:]]*[:=]?[[:space:]]*[0-9]+/compileSdkVersion 35/g' "$f" 2>/dev/null || true
+              sed -i -E 's/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 35/g' "$f" 2>/dev/null || true
+              sed -i -E 's/compileSdk[[:space:]]+[0-9]+/compileSdk 35/g' "$f" 2>/dev/null || true
+              # targetSdk
+              sed -i -E 's/targetSdkVersion[[:space:]]*[:=]?[[:space:]]*[0-9]+/targetSdkVersion 35/g' "$f" 2>/dev/null || true
+              sed -i -E 's/targetSdk[[:space:]]*=[[:space:]]*[0-9]+/targetSdk = 35/g' "$f" 2>/dev/null || true
+              sed -i -E 's/targetSdk[[:space:]]+[0-9]+/targetSdk 35/g' "$f" 2>/dev/null || true
+              # minSdk terlalu tinggi/rendah aneh: biarkan, tapi pastikan minimal 21
+              sed -i -E 's/minSdkVersion[[:space:]]*[:=]?[[:space:]]*([0-9]|1[0-9]|20)\b/minSdkVersion 21/g' "$f" 2>/dev/null || true
+            done
+            # Install platform/build-tools yang dibutuhkan (abaikan gagal: runner biasanya sudah lengkap)
+            if [ -n "${ANDROID_HOME:-}" ] && command -v sdkmanager >/dev/null 2>&1; then
+              yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_HOME" \
+                "platforms;android-35" "build-tools;35.0.0" "platform-tools" >/dev/null 2>&1 || true
+            fi
+          fi
+
           # Tune project gradle.properties (tanpa clean)
           find . -name "gradle.properties" -type f 2>/dev/null | while read -r GP; do
             touch "$GP"
             grep -q 'org.gradle.parallel' "$GP" 2>/dev/null || echo 'org.gradle.parallel=true' >> "$GP"
             grep -q 'org.gradle.caching' "$GP" 2>/dev/null || echo 'org.gradle.caching=true' >> "$GP"
-            grep -q 'org.gradle.jvmargs' "$GP" 2>/dev/null || echo 'org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC' >> "$GP"
+            grep -q 'org.gradle.jvmargs' "$GP" 2>/dev/null || echo 'org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC --enable-native-access=ALL-UNNAMED' >> "$GP"
             grep -q 'android.enableR8.fullMode' "$GP" 2>/dev/null || echo 'android.enableR8.fullMode=false' >> "$GP"
             grep -q 'kotlin.incremental' "$GP" 2>/dev/null || echo 'kotlin.incremental=true' >> "$GP"
+            grep -q 'org.gradle.java.home' "$GP" 2>/dev/null || echo "org.gradle.java.home=$JAVA_HOME" >> "$GP"
+            sed -i '/^org\.gradle\.configuration-cache=/d' "$GP" 2>/dev/null || true
+            echo 'org.gradle.configuration-cache=false' >> "$GP"
           done
 
           # Opsional: minifyEnabled false di release jika project mengaktifkan R8 berat
@@ -235,6 +265,7 @@ jobs:
           if [ -f pubspec.yaml ] && [ "$BUILD_TYPE" != "native" ]; then
             # SPEED MODE: arm64 saja = satu target ABI, sehingga waktu compile + ukuran APK turun.
             # Untuk APK universal arm32+arm64, ubah target-platform kembali di project bila memang diperlukan.
+            set +e
             if [ "$BT" = "release" ]; then
               flutter build apk --release --no-pub --suppress-analytics \
                 --target-platform=android-arm64 \
@@ -242,6 +273,25 @@ jobs:
             else
               flutter build apk --debug --no-pub --suppress-analytics \
                 --target-platform=android-arm64
+            fi
+            BUILD_RC=$?
+            set -e
+            if [ "$BUILD_RC" -ne 0 ]; then
+              echo "::error::flutter build apk gagal (exit $BUILD_RC). Cuplikan log Gradle:"
+              # Tampilkan error paling relevan dari last gradle log bila ada
+              for L in \
+                "$PROJECT_DIR/android/.gradle" \
+                "$GRADLE_USER_HOME/daemon" \
+                "$PROJECT_DIR/build"; do
+                true
+              done
+              # Coba sekali lagi dengan --verbose terbatas supaya error 25.0.5 dll terbaca
+              echo "---- Retry singkat dengan output Gradle lebih jelas ----"
+              export GRADLE_OPTS="--enable-native-access=ALL-UNNAMED"
+              if [ -f android/gradlew ]; then
+                (cd android && chmod +x gradlew && ./gradlew :app:assembleRelease --stacktrace --no-daemon 2>&1 | tail -80) || true
+              fi
+              exit "$BUILD_RC"
             fi
           else
             GRADLE_PATH=$(find . -name gradlew -type f -print -quit)

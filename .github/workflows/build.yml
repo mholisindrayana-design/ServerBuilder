@@ -22,7 +22,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pin runner image agar versi Java default ubuntu-latest tidak berubah diam-diam.
+    runs-on: ubuntu-24.04
     # Target warm-cache: sekitar 3 menit setelah runner tersedia. Runner queue/network tetap di luar kontrol workflow.
     timeout-minutes: 10
     env:
@@ -72,6 +73,14 @@ jobs:
           /home/runner/flutter/bin/flutter config --no-analytics --no-cli-animations >/dev/null 2>&1 || true
           /home/runner/flutter/bin/flutter precache --android --no-ios --no-web --no-linux --no-windows --no-macos >/dev/null 2>&1 || true
 
+      # Pin JDK 17 secara eksplisit. Runner ubuntu-latest terbaru dapat memakai Java 25,
+      # sedangkan sejumlah Gradle/Kotlin plugin proyek Flutter belum kompatibel dengannya.
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       # ── 3) SATU STEP BESAR: setup + download + deps + build + locate ───────
       # Menggabungkan step mengurangi overhead GitHub Actions (~3–8s per step)
       - name: Setup + Build APK
@@ -87,11 +96,24 @@ jobs:
           now() { echo $(( $(date +%s) - T0 )); }
           echo "[00s] Runner started"
 
-          # Java 17 (sudah di runner — jangan install)
-          sudo update-java-alternatives --set java-1.17.0-openjdk-amd64 2>/dev/null || \
-          sudo update-java-alternatives --set temurin-17 2>/dev/null || true
-          export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which java))))"
-          export PATH="/home/runner/flutter/bin:$PATH"
+          # Gunakan JDK 17 dari actions/setup-java; jangan mengambil Java default runner.
+          if [ -n "${JAVA_HOME_17_X64:-}" ] && [ -d "$JAVA_HOME_17_X64" ]; then
+            export JAVA_HOME="$JAVA_HOME_17_X64"
+          fi
+          if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
+            echo "::error::JDK 17 tidak ditemukan setelah setup-java"
+            exit 1
+          fi
+          export PATH="$JAVA_HOME/bin:/home/runner/flutter/bin:$PATH"
+          # Persist and pin JDK 17 for Flutter and every Gradle subprocess.
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
+          flutter config --jdk-dir="$JAVA_HOME" >/dev/null
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          echo "Gradle JDK pin: $JAVA_HOME"
+          JAVA_MAJOR=$(java -version 2>&1 | awk -F '[\".]' '/version/ {print $2; exit}')
+          [ "$JAVA_MAJOR" = "17" ] || { echo "::error::Build wajib memakai Java 17, terdeteksi Java $JAVA_MAJOR"; exit 1; }
           flutter config --no-analytics --no-cli-animations >/dev/null 2>&1 || true
           # Android SDK path (cache-friendly)
           for SDK_CAND in /usr/local/lib/android/sdk /home/runner/Android/Sdk /opt/android-sdk; do
@@ -111,7 +133,8 @@ jobs:
 
           # Gradle global (daemon + cache + parallel)
           mkdir -p "$GRADLE_USER_HOME"
-          cat > "$GRADLE_USER_HOME/gradle.properties" << 'GPEOF'
+          cat > "$GRADLE_USER_HOME/gradle.properties" << GPEOF
+          org.gradle.java.home=$JAVA_HOME
           org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8 -XX:+UseContainerSupport
           org.gradle.parallel=true
           org.gradle.caching=true
@@ -174,8 +197,11 @@ jobs:
             for BG in android/app/build.gradle android/app/build.gradle.kts; do
               [ -f "$BG" ] || continue
               # Pastikan shrink resources tidak memicu full R8 lambat di CI
-              sed -i 's/shrinkResources\s*=\s*true/shrinkResources false/g' "$BG" 2>/dev/null || true
-              sed -i 's/shrinkResources\s*true/shrinkResources false/g' "$BG" 2>/dev/null || true
+              # Kotlin DSL (.kts) butuh 'isShrinkResources = false'; Groovy pakai 'shrinkResources false'.
+              case "$BG" in
+                *.kts) sed -i -E 's/([iI]s)?[sS]hrinkResources[[:space:]]*=?[[:space:]]*true/isShrinkResources = false/g' "$BG" 2>/dev/null || true ;;
+                *)     sed -i -E 's/shrinkResources[[:space:]]*=?[[:space:]]*true/shrinkResources false/g' "$BG" 2>/dev/null || true ;;
+              esac
             done
           fi
 
@@ -196,6 +222,16 @@ jobs:
           [ "$BT" = "native" ] && BT="release"
           echo "[$(now)s] Gradle build started (type=$BUILD_TYPE)"
 
+          # Paksa Gradle (yang dipanggil Flutter) memakai JDK 17 di level PROJECT: properti project mengalahkan
+          # ~/.gradle/gradle.properties, jadi tanpa ini Gradle bisa tetap memakai Java 25 dari runner.
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          if [ -d "$PROJECT_DIR/android" ]; then
+            touch "$PROJECT_DIR/android/gradle.properties"
+            sed -i '/^org\.gradle\.java\.home=/d' "$PROJECT_DIR/android/gradle.properties"
+            echo "org.gradle.java.home=$JAVA_HOME" >> "$PROJECT_DIR/android/gradle.properties"
+          fi
+          echo "Gradle akan memakai: $JAVA_HOME"; "$JAVA_HOME/bin/java" -version 2>&1 | head -1
           if [ -f pubspec.yaml ] && [ "$BUILD_TYPE" != "native" ]; then
             # SPEED MODE: arm64 saja = satu target ABI, sehingga waktu compile + ukuran APK turun.
             # Untuk APK universal arm32+arm64, ubah target-platform kembali di project bila memang diperlukan.
@@ -213,12 +249,13 @@ jobs:
             chmod +x "$GRADLE_PATH"
             (
               cd "$(dirname "$GRADLE_PATH")"
+              echo "JAVA_HOME=$JAVA_HOME"; ./gradlew --version 2>/dev/null | grep -i "JVM" || true
               if [ "$BT" = "debug" ]; then
-                ./gradlew assembleDebug --parallel --build-cache --configuration-cache -q \
-                  || ./gradlew assembleDebug --parallel --build-cache -q
+                ./gradlew assembleDebug --parallel --build-cache --configuration-cache \
+                  || ./gradlew assembleDebug --parallel --build-cache
               else
-                ./gradlew assembleRelease --parallel --build-cache --configuration-cache -q \
-                  || ./gradlew assembleRelease --parallel --build-cache -q
+                ./gradlew assembleRelease --parallel --build-cache --configuration-cache \
+                  || ./gradlew assembleRelease --parallel --build-cache
               fi
             )
           fi

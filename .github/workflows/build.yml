@@ -37,6 +37,7 @@ jobs:
     steps:
       # ── 1) Cache (wajib step terpisah) ─────────────────────────────────────
       - name: Cache Flutter SDK
+        if: ${{ inputs.build_type != 'native' }}
         id: flutter-cache
         uses: actions/cache@v4
         with:
@@ -46,6 +47,7 @@ jobs:
             flutter-sdk-3.32.4-home-
 
       - name: Cache Pub
+        if: ${{ inputs.build_type != 'native' }}
         uses: actions/cache@v4
         with:
           path: /home/runner/.pub-cache
@@ -66,7 +68,7 @@ jobs:
 
       # ── 2) Flutter install (hanya cache miss) ──────────────────────────────
       - name: Install Flutter (cache miss only)
-        if: steps.flutter-cache.outputs.cache-hit != 'true'
+        if: ${{ inputs.build_type != 'native' && steps.flutter-cache.outputs.cache-hit != 'true' }}
         run: |
           curl -fsSL --retry 2 --connect-timeout 8 --max-time 90 https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.32.4-stable.tar.xz \
             | tar -xJ -C /home/runner
@@ -104,17 +106,24 @@ jobs:
             echo "::error::JDK 17 tidak ditemukan setelah setup-java"
             exit 1
           fi
-          export PATH="$JAVA_HOME/bin:/home/runner/flutter/bin:$PATH"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          if [ "$BUILD_TYPE" != "native" ]; then
+            export PATH="/home/runner/flutter/bin:$PATH"
+          fi
           # Persist and pin JDK 17 for Flutter and every Gradle subprocess.
           echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
           echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
-          flutter config --jdk-dir="$JAVA_HOME" >/dev/null
+          if [ "$BUILD_TYPE" != "native" ]; then
+            flutter config --jdk-dir="$JAVA_HOME" >/dev/null
+          fi
           echo "JAVA_HOME=$JAVA_HOME"
           java -version
           echo "Gradle JDK pin: $JAVA_HOME"
           JAVA_MAJOR=$(java -version 2>&1 | awk -F '[\".]' '/version/ {print $2; exit}')
           [ "$JAVA_MAJOR" = "17" ] || { echo "::error::Build wajib memakai Java 17, terdeteksi Java $JAVA_MAJOR"; exit 1; }
-          flutter config --no-analytics --no-cli-animations >/dev/null 2>&1 || true
+          if [ "$BUILD_TYPE" != "native" ]; then
+            flutter config --no-analytics --no-cli-animations >/dev/null 2>&1 || true
+          fi
           # Android SDK path (cache-friendly)
           for SDK_CAND in /usr/local/lib/android/sdk /home/runner/Android/Sdk /opt/android-sdk; do
             if [ -d "$SDK_CAND" ]; then
@@ -125,17 +134,23 @@ jobs:
           done
           if [ -n "${ANDROID_HOME:-}" ]; then
             export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-            flutter config --android-sdk "$ANDROID_HOME" >/dev/null 2>&1 || true
+            if [ "$BUILD_TYPE" != "native" ]; then
+              flutter config --android-sdk "$ANDROID_HOME" >/dev/null 2>&1 || true
+            fi
           fi
-          # Licenses: cepat jika sudah di-cache; jangan blok lama
-          yes 2>/dev/null | flutter doctor --android-licenses >/dev/null 2>&1 || true
-          echo "[$(now)s] Flutter ready"
+          # Native Android tidak memerlukan Flutter CLI / Flutter doctor.
+          if [ "$BUILD_TYPE" != "native" ]; then
+            yes 2>/dev/null | flutter doctor --android-licenses >/dev/null 2>&1 || true
+            echo "[$(now)s] Flutter ready"
+          else
+            echo "[$(now)s] Native Gradle mode: Flutter setup dilewati"
+          fi
 
           # Gradle global (daemon + cache + parallel)
           mkdir -p "$GRADLE_USER_HOME"
           cat > "$GRADLE_USER_HOME/gradle.properties" << GPEOF
           org.gradle.java.home=$JAVA_HOME
-          org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8 -XX:+UseContainerSupport --enable-native-access=ALL-UNNAMED
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8 -XX:+UseContainerSupport --enable-native-access=ALL-UNNAMED
           org.gradle.parallel=true
           org.gradle.caching=true
           org.gradle.daemon=true
@@ -156,9 +171,8 @@ jobs:
           android.nonFinalResIds=true
           android.suppressUnsupportedCompileSdk=35,36
           GPEOF
-          # Bunuh daemon Gradle lama (bisa masih pegang Java 25 dari runner)
-          (cd /tmp && pkill -f 'GradleDaemon' 2>/dev/null) || true
-          rm -rf "$GRADLE_USER_HOME/daemon" 2>/dev/null || true
+          # Jangan membunuh daemon Gradle: daemon + cache membantu mengurangi
+          # waktu konfigurasi/kompilasi, terutama untuk build berulang.
 
           # Download + extract project
           HTTP_CODE=$(curl -fsSL --retry 2 --retry-delay 0 --connect-timeout 8 --max-time 60 --compressed \
@@ -185,7 +199,7 @@ jobs:
           # ── Patch project Android: buang buildToolsVersion usang (mis. 25.0.5),
           #    naikkan compileSdk, pastikan minSdk aman. Ini penyebab umum error
           #    "* What went wrong:\n25.0.5" di assembleRelease.
-          if [ -d android ]; then
+          if [ -d android ] || { [ "$BUILD_TYPE" = "native" ] && [ -d app ]; }; then
             # Hapus / netralkan baris buildToolsVersion (AGP modern memilih sendiri)
             find android -type f \( -name "*.gradle" -o -name "*.gradle.kts" \) -print0 2>/dev/null | while IFS= read -r -d "" f; do
               sed -i -E '/buildToolsVersion/d' "$f" 2>/dev/null || true
@@ -202,8 +216,13 @@ jobs:
             done
             # Install platform/build-tools yang dibutuhkan (abaikan gagal: runner biasanya sudah lengkap)
             if [ -n "${ANDROID_HOME:-}" ] && command -v sdkmanager >/dev/null 2>&1; then
-              yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_HOME" \
-                "platforms;android-35" "build-tools;35.0.0" "platform-tools" >/dev/null 2>&1 || true
+              NEED_ANDROID_COMPONENTS=0
+              [ -d "$ANDROID_HOME/platforms/android-35" ] || NEED_ANDROID_COMPONENTS=1
+              [ -d "$ANDROID_HOME/build-tools/35.0.0" ] || NEED_ANDROID_COMPONENTS=1
+              if [ "$NEED_ANDROID_COMPONENTS" = "1" ]; then
+                yes 2>/dev/null | sdkmanager --sdk_root="$ANDROID_HOME" \
+                  "platforms;android-35" "build-tools;35.0.0" "platform-tools" >/dev/null 2>&1 || true
+              fi
             fi
           fi
 
@@ -213,14 +232,24 @@ jobs:
             # Hapus properti yang sudah dihapus di AGP 7+ (biar build tidak gagal)
             sed -i -E '/^[[:space:]]*android\.enableBuildCache[[:space:]]*=.*/d' "$GP" 2>/dev/null || true
             sed -i -E '/^[[:space:]]*android\.enableBuildCache[[:space:]]*$/d' "$GP" 2>/dev/null || true
-            grep -q 'org.gradle.parallel' "$GP" 2>/dev/null || echo 'org.gradle.parallel=true' >> "$GP"
-            grep -q 'org.gradle.caching' "$GP" 2>/dev/null || echo 'org.gradle.caching=true' >> "$GP"
-            grep -q 'org.gradle.jvmargs' "$GP" 2>/dev/null || echo 'org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC --enable-native-access=ALL-UNNAMED' >> "$GP"
+            # Timpa juga nilai false bawaan template agar build cache benar-benar aktif.
+            sed -i -E '/^org\.gradle\.(parallel|caching|daemon|workers\.max)=/d' "$GP" 2>/dev/null || true
+            {
+              echo 'org.gradle.parallel=true'
+              echo 'org.gradle.caching=true'
+              echo 'org.gradle.daemon=true'
+              echo 'org.gradle.workers.max=4'
+            } >> "$GP"
+            grep -q 'org.gradle.jvmargs' "$GP" 2>/dev/null || echo 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC --enable-native-access=ALL-UNNAMED' >> "$GP"
             grep -q 'android.enableR8.fullMode' "$GP" 2>/dev/null || echo 'android.enableR8.fullMode=false' >> "$GP"
             grep -q 'kotlin.incremental' "$GP" 2>/dev/null || echo 'kotlin.incremental=true' >> "$GP"
             grep -q 'org.gradle.java.home' "$GP" 2>/dev/null || echo "org.gradle.java.home=$JAVA_HOME" >> "$GP"
             sed -i '/^org\.gradle\.configuration-cache=/d' "$GP" 2>/dev/null || true
-            echo 'org.gradle.configuration-cache=false' >> "$GP"
+            if [ "$BUILD_TYPE" = "native" ]; then
+              echo 'org.gradle.configuration-cache=true' >> "$GP"
+            else
+              echo 'org.gradle.configuration-cache=false' >> "$GP"
+            fi
           done
 
           # Opsional: minifyEnabled false di release jika project mengaktifkan R8 berat
@@ -303,11 +332,11 @@ jobs:
               cd "$(dirname "$GRADLE_PATH")"
               echo "JAVA_HOME=$JAVA_HOME"; ./gradlew --version 2>/dev/null | grep -i "JVM" || true
               if [ "$BT" = "debug" ]; then
-                ./gradlew assembleDebug --parallel --build-cache --configuration-cache \
-                  || ./gradlew assembleDebug --parallel --build-cache
+                ./gradlew assembleDebug --parallel --max-workers=4 --build-cache --configuration-cache \
+                  || ./gradlew assembleDebug --parallel --max-workers=4 --build-cache
               else
-                ./gradlew assembleRelease --parallel --build-cache --configuration-cache \
-                  || ./gradlew assembleRelease --parallel --build-cache
+                ./gradlew assembleRelease --parallel --max-workers=4 --build-cache --configuration-cache \
+                  || ./gradlew assembleRelease --parallel --max-workers=4 --build-cache
               fi
             )
           fi
@@ -333,13 +362,18 @@ jobs:
             APK=$(find "$PROJECT_DIR" -name "*.apk" -type f ! -name "*unaligned*" -print -quit 2>/dev/null || true)
           fi
           [ -z "$APK" ] && echo "APK tidak ditemukan!" && exit 1
-          echo "APK: $(ls -lh "$APK" | awk '{print $5, $9}')"
+          [ -s "$APK" ] || { echo "::error::APK kosong atau tidak valid"; exit 1; }
+          APK_BYTES=$(stat -c%s "$APK")
+          [ "$APK_BYTES" -ge 50000 ] || { echo "::error::Ukuran APK terlalu kecil (${APK_BYTES} bytes)"; exit 1; }
+          unzip -tq "$APK" >/dev/null || { echo "::error::APK gagal validasi ZIP/container"; exit 1; }
+          unzip -Z1 "$APK" | grep -qx 'AndroidManifest.xml' || { echo "::error::AndroidManifest.xml tidak ditemukan di APK"; exit 1; }
+          echo "APK valid: $(ls -lh "$APK" | awk '{print $5, $9}')"
           ln -f "$APK" "$GITHUB_WORKSPACE/output.apk" 2>/dev/null || cp -f "$APK" "$GITHUB_WORKSPACE/output.apk"
 
           TOTAL=$(( $(date +%s) - T0 ))
           echo "[${TOTAL}s] Build pipeline done"
-          if [ "$TOTAL" -gt 60 ]; then
-            echo "::warning::Warm-path target 60s terlewati (${TOTAL}s). Queue/cache GitHub dapat menambah overhead; cek log timing di atas."
+          if [ "$TOTAL" -gt 180 ]; then
+            echo "::warning::Target build 180s terlewati (${TOTAL}s). Queue/cache GitHub dan ukuran project dapat menambah overhead; cek log timing di atas."
           fi
 
           # Upload APK mentah ke Release yang sudah dibuat bot.
